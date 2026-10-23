@@ -2,7 +2,7 @@ name: Philly scores
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -10,9 +10,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  poll:
+  notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +29,10 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Poll scores
+      - name: Check games and notify
         run: python philly_scores.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          RUN_SECONDS: "270"
 
       - name: Save state
         if: always()

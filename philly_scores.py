@@ -1,7 +1,11 @@
-"""Posts live scores for Philadelphia pro teams to a Discord channel via webhook.
+"""Discord notifications for Philadelphia pro teams.
 
-One message per game: created when the game starts, edited on every score/clock
-change, and left as the final score when the game ends.
+Posts two kinds of messages to a Discord webhook:
+  * "Upcoming game" -- once, when a game is within 24 hours of starting
+  * "Final score"   -- once, when a game ends
+
+Each run is a single pass; schedule it (e.g. GitHub Actions cron). Which games
+were already announced is remembered in state.json so nothing is posted twice.
 
 Setup:
     pip install requests
@@ -10,25 +14,25 @@ Setup:
 """
 import json
 import os
-import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"].rstrip("/")
-POLL_SECONDS = 30
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))  # 0 = run forever
 STATE_FILE = "state.json"
 BASE = "https://site.api.espn.com/apis/site/v2/sports"
 
 # Eagles, Sixers, Phillies, Flyers, Union
 LEAGUES = [
-    ("football", "nfl"),
-    ("basketball", "nba"),
-    ("baseball", "mlb"),
-    ("hockey", "nhl"),
-    ("soccer", "usa.1"),
+    ("football", "nfl", "NFL"),
+    ("basketball", "nba", "NBA"),
+    ("baseball", "mlb", "MLB"),
+    ("hockey", "nhl", "NHL"),
+    ("soccer", "usa.1", "MLS"),
 ]
 TEAM_MATCH = "Philadelphia"
+UPCOMING_WINDOW = timedelta(hours=24)
+NOT_HAPPENING = {"STATUS_POSTPONED", "STATUS_CANCELED"}
 
 
 def load_state():
@@ -39,76 +43,98 @@ def load_state():
         return {}
 
 
-def save_state(state):
+def save_state(upcoming, final):
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump({"upcoming": sorted(upcoming), "final": sorted(final)}, f)
 
 
 def philly_games():
-    for sport, league in LEAGUES:
+    """Yield (league label, event, competition) for Philly games from yesterday to +2 days."""
+    today = datetime.now(timezone.utc).date()
+    dates = f"{today - timedelta(days=1):%Y%m%d}-{today + timedelta(days=2):%Y%m%d}"
+    for sport, league, label in LEAGUES:
         try:
-            resp = requests.get(f"{BASE}/{sport}/{league}/scoreboard", timeout=15)
+            resp = requests.get(
+                f"{BASE}/{sport}/{league}/scoreboard",
+                params={"dates": dates, "limit": 300},
+                timeout=15,
+            )
             resp.raise_for_status()
             events = resp.json().get("events", [])
         except Exception as e:
-            print(f"[{league}] fetch failed: {e}")
+            print(f"[{label}] fetch failed: {e}")
             continue
         for ev in events:
             comp = ev["competitions"][0]
             if any(TEAM_MATCH in t["team"]["displayName"] for t in comp["competitors"]):
-                yield league.upper().replace(".1", ""), ev, comp
+                yield label, ev, comp
 
 
-def build_embed(league, ev, comp):
-    status = ev["status"]["type"]
+def sides(comp):
     away = next(t for t in comp["competitors"] if t["homeAway"] == "away")
     home = next(t for t in comp["competitors"] if t["homeAway"] == "home")
+    return away, home
+
+
+def upcoming_embed(label, comp, start):
+    away, home = sides(comp)
+    ts = int(start.timestamp())  # Discord shows this in each viewer's own timezone
+    lines = [
+        f"**{away['team']['displayName']}** @ **{home['team']['displayName']}**",
+        f"<t:{ts}:F> (<t:{ts}:R>)",
+    ]
+    venue = comp.get("venue", {}).get("fullName")
+    if venue:
+        lines.append(venue)
+    tv = [n for b in comp.get("broadcasts", []) for n in b.get("names", [])]
+    if tv:
+        lines.append("TV: " + ", ".join(tv))
+    return {"title": f"{label} \u2022 Upcoming game", "description": "\n".join(lines), "color": 0x3498DB}
+
+
+def final_embed(label, ev, comp):
+    away, home = sides(comp)
+    philly = next(t for t in (away, home) if TEAM_MATCH in t["team"]["displayName"])
+    if philly.get("winner"):
+        color = 0x2ECC71  # Philly won
+    elif away.get("winner") or home.get("winner"):
+        color = 0xE74C3C  # Philly lost
+    else:
+        color = 0x95A5A6  # tie
     desc = (
         f"{away['team']['displayName']}  **{away.get('score', 0)}**\n"
         f"{home['team']['displayName']}  **{home.get('score', 0)}**"
     )
-    live = status["state"] == "in"
-    return {
-        "title": f"{league} \u2022 {status['shortDetail']}",
-        "description": desc,
-        "color": 0x2ECC71 if live else 0x95A5A6,
-    }
+    return {"title": f"{label} \u2022 {ev['status']['type']['shortDetail']}", "description": desc, "color": color}
 
 
-def send_or_edit(rec, embed):
-    if rec is None:
-        r = requests.post(WEBHOOK, params={"wait": "true"}, json={"embeds": [embed]}, timeout=15)
-        r.raise_for_status()
-        return {"msg": r.json()["id"]}
-    r = requests.patch(f"{WEBHOOK}/messages/{rec['msg']}", json={"embeds": [embed]}, timeout=15)
+def post(embed):
+    r = requests.post(WEBHOOK, json={"embeds": [embed]}, timeout=15)
     r.raise_for_status()
-    return rec
 
 
 def main():
     state = load_state()
-    deadline = time.time() + RUN_SECONDS if RUN_SECONDS else None
-    while True:
-        for league, ev, comp in philly_games():
-            if ev["status"]["type"]["state"] == "pre":
-                continue  # not started yet
-            gid = ev["id"]
-            embed = build_embed(league, ev, comp)
-            key = json.dumps(embed, sort_keys=True)
-            rec = state.get(gid)
-            if rec and rec.get("key") == key:
-                continue  # nothing changed
-            try:
-                rec = send_or_edit(rec, embed)
-            except Exception as e:
-                print(f"[{league}] discord error: {e}")
-                continue
-            rec["key"] = key
-            state[gid] = rec
-            save_state(state)
-        if deadline and time.time() + POLL_SECONDS > deadline:
-            break  # let the next scheduled run take over
-        time.sleep(POLL_SECONDS)
+    sent_upcoming = set(state.get("upcoming", []))
+    sent_final = set(state.get("final", []))
+    now = datetime.now(timezone.utc)
+
+    for label, ev, comp in philly_games():
+        key = f"{label}:{ev['id']}"
+        status = ev["status"]["type"]
+        try:
+            if status["state"] == "post" and status.get("completed") and key not in sent_final:
+                post(final_embed(label, ev, comp))
+                sent_final.add(key)
+            elif status["state"] == "pre" and status["name"] not in NOT_HAPPENING and key not in sent_upcoming:
+                start = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+                if now < start <= now + UPCOMING_WINDOW:
+                    post(upcoming_embed(label, comp, start))
+                    sent_upcoming.add(key)
+        except Exception as e:
+            print(f"[{label}] discord error: {e}")
+
+    save_state(sent_upcoming, sent_final)
 
 
 if __name__ == "__main__":

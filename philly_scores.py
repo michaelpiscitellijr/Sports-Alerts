@@ -16,6 +16,7 @@ import requests
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"].rstrip("/")
 POLL_SECONDS = 30
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))  # 0 = run forever
 STATE_FILE = "state.json"
 BASE = "https://site.api.espn.com/apis/site/v2/sports"
 
@@ -86,6 +87,7 @@ def send_or_edit(rec, embed):
 
 def main():
     state = load_state()
+    deadline = time.time() + RUN_SECONDS if RUN_SECONDS else None
     while True:
         for league, ev, comp in philly_games():
             if ev["status"]["type"]["state"] == "pre":
@@ -104,6 +106,8 @@ def main():
             rec["key"] = key
             state[gid] = rec
             save_state(state)
+        if deadline and time.time() + POLL_SECONDS > deadline:
+            break  # let the next scheduled run take over
         time.sleep(POLL_SECONDS)
 
 
